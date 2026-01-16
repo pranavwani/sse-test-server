@@ -9,8 +9,13 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const USE_HTTPS = process.env.USE_HTTPS === 'true';
 
+const storeExpirations = new Map(); // streamId -> timeout ID
+const DEFAULT_TLS_MS = 3000000; // 5 min
+
 app.use(cors()); // Enable CORS for all routes
 app.use(bodyParser.json()); // For parsing POST bodies
+
+const eventStore = new Map(); // Key: streamId, Value: array of {id, data}
 
 // Helper to send SSE-formatted data
 function sendEvent(res, data, options = {}) {
@@ -19,6 +24,20 @@ function sendEvent(res, data, options = {}) {
     if (options.retry) res.write(`retry: ${options.retry}\n`);
     res.write(`data: ${JSON.stringify(data)}\n\n`);
     res.flushHeaders(); // Ensure data is sent immediately
+}
+
+function setStoreExpiration(streamId) {
+    // Clear any existing timer for this streamId
+    if (storeExpirations.has(streamId)) {
+        clearTimeout(storeExpirations.get(streamId));
+    }
+    const timeout = setTimeout(() => {
+        eventStore.delete(streamId);
+        storeExpirations.delete(streamId);
+        console.log(`Auto-expired inactive stream: ${streamId}`);
+    }, DEFAULT_TLS_MS);
+    
+    storeExpirations.set(streamId, timeout);
 }
 
 // Basic test stream: Sends periodic events with optional configs via query params
@@ -37,18 +56,53 @@ app.get('/sse/test', (req, res) => {
         delay,
         largePayload,
         errorAfter,
+        streamId = 'default',
     } = req.query; // Default to 2s
     let count = 0;
     let lastId = 0;
 
-    // Initial connection message with optional retry
-    sendEvent(
-        res,
-        {
-            message: 'Connected to test SSE server',
-        },
-        { retry, id: ++lastId }
-    );
+    // Initialize store if new
+    if (!eventStore.has(streamId)) {
+        eventStore.set(streamId, []);
+    }
+
+    // Handle reconnection (client may send Last-Event-ID header)
+    const lastEventId = req.headers['last-event-id']
+        ? parseInt(req.headers['last-event-id'])
+        : 0;
+    if (lastEventId > 0) {
+        const storedEvents = eventStore.get(streamId);
+        const resumeFrom =
+            storedEvents.findIndex((event) => event.id === lastEventId) + 1;
+        // TODO: have to look if all events are streamed successfully and connection fail
+        if (resumeFrom > 0) {
+            for (let i = resumeFrom; i < storedEvents.length; i++) {
+                // Send missed events
+                sendEvent(res, storedEvents[i].data, {
+                    id: storedEvents[i].id,
+                    event: eventType,
+                });
+            }
+            lastId = storedEvents[storedEvents.length - 1]?.id || 0;
+            count = lastId; // Sync count
+        }
+
+        sendEvent(
+            res,
+            { message: `Resumed from ID ${lastEventId}` },
+            { id: ++lastId, retry }
+        );
+    } else {
+        // Initial connection message with optional retry
+        sendEvent(
+            res,
+            { message: 'Connected to test SSE server' },
+            { retry, id: ++lastId }
+        );
+    }
+
+    // Reset/Start expiration timer on every new connection/reconnection
+    setStoreExpiration(streamId);
 
     // Send events periodically
     const streamInterval = setInterval(() => {
@@ -82,21 +136,25 @@ app.get('/sse/test', (req, res) => {
             }
 
             sendEvent(res, payload, { event: eventType, id: ++lastId });
+
+            // Store the event
+            const storedEvents = eventStore.get(streamId);
+            storedEvents.push({ id: lastId, data: payload });
+            if (storedEvents.length > 100) storedEvents.shift(); // Limit size for memory;
+
+            // Reset expiration timer because activity happened
+            setStoreExpiration(streamId);
         }
     }, parseInt(interval));
-
-    // Handle reconnection (client may send Last-Event-ID header)
-    if (req.headers['last-event-id']) {
-        sendEvent(
-            res,
-            { message: `Reconnected after ID ${req.headers['last-event-id']}` },
-            { id: ++lastId }
-        );
-    }
 
     // Cleanup on client disconnect
     res.on('close', () => {
         clearInterval(streamInterval);
+        if (count >= maxEvents) {
+            // Stream complete: Flush immediately
+            eventStore.delete(streamId);
+            storeExpirations.delete(streamId);
+        }
         res.end();
     });
 });
