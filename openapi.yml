@@ -1,0 +1,144 @@
+openapi: 3.0.0
+info:
+  title: SSE Test Server API
+  description: A configurable test server for Server-Sent Events (SSE) to validate proxies and clients.
+  version: 1.0.0
+servers:
+  - url: http://localhost:3000
+    description: Local server
+  - url: https://your-prod-domain.com
+    description: Production server
+
+paths:
+  /sse/test:
+    get:
+      summary: Basic SSE test stream with configurable options
+      description: Streams periodic events. Supports reconnection via Last-Event-ID.
+      parameters:
+        - name: interval
+          in: query
+          schema: { type: integer, default: 2000 }
+          description: Interval between events (ms)
+        - name: eventType
+          in: query
+          schema: { type: string }
+          description: Custom event type (e.g., 'update')
+        - name: retry
+          in: query
+          schema: { type: integer }
+          description: Retry interval for client (ms)
+        - name: maxEvents
+          in: query
+          schema: { type: integer, default: Infinity }
+          description: Max events before ending stream
+        - name: delay
+          in: query
+          schema: { type: integer }
+          description: Delay before next event (ms)
+        - name: largePayload
+          in: query
+          schema: { type: boolean }
+          description: Include ~1MB payload per event
+        - name: errorAfter
+          in: query
+          schema: { type: integer }
+          description: Send 500 error after N events
+        - name: streamId
+          in: query
+          schema: { type: string, default: default }
+          description: Unique ID for stream resumption
+      responses:
+        '200':
+          description: SSE stream
+          content:
+            text/event-stream:
+              schema: { type: string }
+        '500':
+          description: Simulated error (if errorAfter triggered)
+      x-usage-examples:
+        - description: Basic stream
+          query: ?interval=1000
+        - description: Finite stream with resumption
+          query: ?maxEvents=10&streamId=test1
+        - description: Error simulation
+          query: ?errorAfter=5
+
+  /sse/stream-file:
+    get:
+      summary: Simulated file streaming via SSE
+      description: Generates and streams synthetic file data in chunks. Supports resumption.
+      parameters:
+        - name: totalBytes
+          in: query
+          schema: { type: integer, default: 1048576 }
+          description: Total size of simulated file (bytes)
+        - name: chunkSize
+          in: query
+          schema: { type: integer, default: 8192 }
+          description: Size per chunk/event (bytes)
+        - name: delayMs
+          in: query
+          schema: { type: integer, default: 50 }
+          description: Delay between chunks (ms)
+        - name: streamId
+          in: query
+          schema: { type: string }
+          description: Unique ID for stream
+        - name: eventType
+          in: query
+          schema: { type: string, default: chunk }
+          description: Custom event type
+        - name: format
+          in: query
+          schema: { type: string, default: text, enum: [text, jsonl, binary] }
+          description: Data format (text, JSON lines, base64 binary)
+      responses:
+        '200':
+          description: SSE stream of file chunks
+          content:
+            text/event-stream:
+              schema: { type: string }
+      x-usage-examples:
+        - description: 1MB text file, slow stream
+          query: ?totalBytes=1048576&delayMs=200
+        - description: JSON logs with resumption
+          query: ?format=jsonl&streamId=logstream&totalBytes=524288
+        - description: Large binary simulation
+          query: ?format=binary&totalBytes=10485760&chunkSize=16384
+
+  /sse/echo:
+    post:
+      summary: Echo POST data as SSE event
+      description: Sends back posted JSON as a single SSE event.
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object }
+      responses:
+        '200':
+          description: Echoed SSE event
+          content:
+            text/event-stream:
+              schema: { type: string }
+      x-usage-examples:
+        - description: Echo simple data
+          body: { "test": "hello" }
+
+  /sse/error:
+    get:
+      summary: Simulate HTTP errors
+      parameters:
+        - name: code
+          in: query
+          schema: { type: integer, default: 500 }
+          description: Error code to return
+      responses:
+        'default':
+          description: Simulated error response
+
+  /sse/timeout:
+    get:
+      summary: Simulate timeout (30s delay)
+      responses:
+        '408':
+          description: Timeout response
