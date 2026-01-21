@@ -36,9 +36,20 @@ function setStoreExpiration(streamId) {
         storeExpirations.delete(streamId);
         console.log(`Auto-expired inactive stream: ${streamId}`);
     }, DEFAULT_TLS_MS);
-    
+
     storeExpirations.set(streamId, timeout);
 }
+
+/**
+ * Global state for all streams
+ * 
+ * streamId → {
+ *  events: array of { id, data, event: string? }   // Stored history for catch-up
+ *  timer: NodeJS.Timeout | null                    // Global interval for generating events
+ *  
+ * }
+ */
+
 
 // Basic test stream: Sends periodic events with optional configs via query params
 app.get('/sse/test', (req, res) => {
@@ -53,12 +64,11 @@ app.get('/sse/test', (req, res) => {
         eventType,
         retry,
         maxEvents = Infinity,
-        delay,
         largePayload,
         errorAfter,
         streamId = 'default',
     } = req.query; // Default to 2s
-    let count = 0;
+    let eventCount = 0;
     let lastId = 0;
 
     // Initialize store if new
@@ -84,20 +94,20 @@ app.get('/sse/test', (req, res) => {
                 });
             }
             lastId = storedEvents[storedEvents.length - 1]?.id || 0;
-            count = lastId; // Sync count
+            eventCount = lastId; // Sync count
         }
 
         sendEvent(
             res,
-            { message: `Resumed from ID ${lastEventId}` },
-            { id: ++lastId, retry }
+            { message: `Resumed from ID ${lastEventId}, current: ${lastId}` },
+            { id: ++lastId, retry },
         );
     } else {
         // Initial connection message with optional retry
         sendEvent(
             res,
             { message: 'Connected to test SSE server' },
-            { retry, id: ++lastId }
+            { retry, id: ++lastId },
         );
     }
 
@@ -106,31 +116,26 @@ app.get('/sse/test', (req, res) => {
 
     // Send events periodically
     const streamInterval = setInterval(() => {
-        if (count >= maxEvents) {
+        if (eventCount >= maxEvents) {
             res.end();
             return;
         }
 
-        if (errorAfter && count == errorAfter) {
+        if (errorAfter && eventCount == errorAfter) {
             res.status(500).end('Simulated server error');
             return;
         }
 
-        if (delay) {
-            // Simulate delay before next event
-            setTimeout(() => sendNextEvent(), parseInt(delay));
-        } else {
-            sendNextEvent();
-        }
+        sendNextEvent();
 
         function sendNextEvent() {
             let payload = {
                 time: new Date().toISOString(),
-                count: ++count,
+                eventCount: ++eventCount,
                 message: 'Test event',
             };
 
-            if (largePayload) {
+            if (largePayload === 'true') {
                 // Simulate large payload (e.g., 1 MB of data)
                 payload.largeData = 'x'.repeat(1024 * 1024);
             }
@@ -150,7 +155,7 @@ app.get('/sse/test', (req, res) => {
     // Cleanup on client disconnect
     res.on('close', () => {
         clearInterval(streamInterval);
-        if (count >= maxEvents) {
+        if (eventCount >= maxEvents) {
             // Stream complete: Flush immediately
             eventStore.delete(streamId);
             storeExpirations.delete(streamId);
@@ -199,7 +204,7 @@ app.get('/sse/multi', (req, res) => {
             sendEvent(
                 res,
                 { message: `Event of type: ${type}` },
-                { event: type, id: ++id }
+                { event: type, id: ++id },
             );
             if (index == 2) res.end();
         }, index * 5000);
@@ -208,17 +213,138 @@ app.get('/sse/multi', (req, res) => {
     req.on('close', () => res.end());
 });
 
+// File streaming simulation
+app.get('/sse/stream-file', (req, res) => {
+    res.set({
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        Connection: 'keep-alive',
+    });
+
+    const {
+        totalBytes = 1024 * 1024, // default 1 MB
+        chunkSize = 8192, // ~8KB per chunk (realistic)
+        delayMs = 50, // ms between chunks
+        streamId = 'sim-file-' + Date.now(), // unique by default
+        eventType = 'chunk',
+        format = 'text', // 'text' | 'jsonl' | 'binary'
+    } = req.query;
+
+    const totalBytesNum = parseInt(totalBytes);
+    const chunkSizeNum = Math.max(1, parseInt(chunkSize));
+    const delayNum = parseInt(delayMs);
+
+    // For resumption support
+    if (!eventStore.has(streamId)) {
+        eventStore.set(streamId, []);
+    }
+
+    const stored = eventStore.get(streamId);
+
+    let byteSent = 0;
+    let chunkIndex = 0;
+    let lastId = 0;
+
+    // Handle reconnection with Last-Event-ID
+    const lastEventId = req.headers['last-event-id']
+        ? parseInt(req.headers['last-event-id'])
+        : 0;
+
+    if (lastEventId > 0) {
+        const resumeIndex = stored.findIndex((e) => e.id === lastEventId);
+
+        if (resumeIndex > 0) {
+            for (let i = resumeIndex; i < stored.length; i++) {
+                sendEvent(res, stored[i].data, {
+                    id: stored[i].id,
+                    event: eventType,
+                });
+            }
+            byteSent = stored.length * chunkSizeNum; // approximate
+            chunkIndex = stored.length;
+            lastId = lastEventId;
+            sendEvent(
+                res,
+                {
+                    message: `Resume simulated file chunk from chunk ${chunkIndex}`,
+                },
+                { id: ++lastId },
+            );
+        }
+    } else {
+        sendEvent(
+            res,
+            {
+                message: `Starting simulated file stream`,
+            },
+            { id: ++lastId },
+        );
+    }
+
+    setStoreExpiration(streamId);
+
+    const interval = setInterval(() => {
+        if (byteSent >= totalBytesNum) {
+            sendEvent(res, {}, { id: ++lastId, event: 'end' });
+            clearInterval(interval);
+            res.end();
+            return;
+        }
+
+        chunkIndex++;
+        lastId++;
+
+        let chunkData;
+        if (format === 'jsonl') {
+            chunkData =
+                JSON.stringify({
+                    chunk: chunkIndex,
+                    timeStamp: new Date().toISOString(),
+                    data: 'x'.repeat(chunkSizeNum - 50), // approximate size
+                }) + '\n';
+        } else if (format === 'binary') {
+            // For binary testing (Base64 encoded in data field)
+            const buffer = Buffer.alloc(chunkSizeNum).fill('x');
+            chunkData = buffer.toString('base64');
+        } else {
+            // plain text
+            chunkData = 'x'.repeat(chunkSizeNum) + '\n';
+        }
+
+        const payload = {
+            chunkIndex,
+            size: chunkData.length,
+            content: chunkData,
+        };
+
+        sendEvent(res, payload, { event: eventType, id: lastId });
+
+        // Store for resumption
+        stored.push({ id: lastId, data: payload });
+        if (stored.length > 500) stored.shift(); // prevent unbounded growth
+
+        byteSent += chunkData.length;
+
+        setStoreExpiration(streamId);
+    }, delayNum);
+
+    req.on('close', () => {
+        clearInterval(interval);
+        res.end();
+    });
+});
+
 if (USE_HTTPS) {
     const options = {
-        key: fs.readFileSync('/certs/cert1.pem'), // Path inside container
-        cert: fs.readFileSync('/certs/privkey1.pem'),
+        key: fs.readFileSync('/certs/cert.pem'), // Path inside container
+        cert: fs.readFileSync('/certs/privkey.pem'),
     };
     https.createServer(options, app).listen(PORT, () => {
         console.log(
-            `Advanced SSE test server running on HTTPS https://localhost:${PORT}`
+            `Advanced SSE test server running on HTTPS https://localhost:${PORT}`,
         );
         console.log(
-            '- /sse/test?interval=1000&eventType=custom&retry=5&&maxEvents=10&delay=2---&largePayload=true&errorAfter=5'
+            '- /sse/test?interval=1000&eventType=custom&retry=5&&maxEvents=10&delay=2---&largePayload=true&errorAfter=5',
         );
         console.log('- POST /sse/echo (send JSON body)');
         console.log('- /sse/error?code=404');
@@ -228,10 +354,10 @@ if (USE_HTTPS) {
 } else {
     app.listen(3000, () => {
         console.log(
-            `Advanced SSE test server running on HTTP http://localhost:${PORT}`
+            `Advanced SSE test server running on HTTP http://localhost:${PORT}`,
         );
         console.log(
-            '- /sse/test?interval=1000&eventType=custom&retry=5&&maxEvents=10&delay=2---&largePayload=true&errorAfter=5'
+            '- /sse/test?interval=1000&eventType=custom&retry=5&&maxEvents=10&delay=2---&largePayload=true&errorAfter=5',
         );
         console.log('- POST /sse/echo (send JSON body)');
         console.log('- /sse/error?code=404');
