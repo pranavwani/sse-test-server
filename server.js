@@ -551,7 +551,7 @@ app.get('/sse/stream-file', (req, res) => {
 if (USE_HTTPS) {
     const options = {
         key: readFileSync('/certs/privkey.pem'), // Path inside container
-        cert: readFileSync('/certs/cert.pem'),
+        cert: readFileSync('/certs/fullchain.pem'),
     };
     createServer(options, app).listen(PORT, () => {
         console.log(
