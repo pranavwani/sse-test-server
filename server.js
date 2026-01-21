@@ -1,7 +1,12 @@
 import express from 'express';
 import cors from 'cors';
 import bodyParser from 'body-parser';
-import https from 'https';
+import { createServer } from 'https';
+import { readFileSync } from 'fs';
+import swaggerUi from 'swagger-ui-express';
+import { fileURLToPath } from 'url';
+import path from 'path';
+import YAML from 'yaml';
 import fs from 'fs';
 
 const app = express();
@@ -14,6 +19,31 @@ const DEFAULT_TLS_MS = 3000000; // 5 min
 
 app.use(cors()); // Enable CORS for all routes
 app.use(bodyParser.json()); // For parsing POST bodies
+
+// ---- Swagger UI & Spec ----
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// Load YAML once at boot
+const specPath = path.resolve(__dirname, '.', 'openapi.yml');
+const swaggerDocument = YAML.parse(fs.readFileSync(specPath, 'utf8'));
+
+// Serve Swagger UI at ROOT /
+app.use(
+    '/docs',
+    swaggerUi.serve,
+    swaggerUi.setup(swaggerDocument, {
+        // Optional nice tweaks:
+        explorer: true, // Shows search bar
+        customSiteTitle: 'SSE Test Server',
+        swaggerOptions: {
+            displayRequestDuration: true,
+            // docExpansion: 'none',            // Collapse sections by default
+            // defaultModelsExpandDepth: -1,    // Hide models if you want cleaner look
+        },
+        customCss: '.swagger-ui .topbar { display: none }', // Optional: hide top bar for cleaner root page
+    }),
+);
 
 const eventStore = new Map(); // Key: streamId, Value: array of {id, data}
 
@@ -40,16 +70,37 @@ function setStoreExpiration(streamId) {
     storeExpirations.set(streamId, timeout);
 }
 
-/**
- * Global state for all streams
- * 
- * streamId → {
- *  events: array of { id, data, event: string? }   // Stored history for catch-up
- *  timer: NodeJS.Timeout | null                    // Global interval for generating events
- *  
- * }
- */
+// Global state for all streams
+const streams = new Map();
+// streamId → {
+//   events: array of {id, data, event: string?},  // Stored history for catch-up
+//   timer: NodeJS.Timeout | null,                 // Global interval for generating events
+//   lastActivity: number (Date.now()),            // For inactivity timeout
+//   count: number,                                // Total events generated so far
+//   lastId: number,                               // Last event ID
+//   maxEvents: number | Infinity,                 // Locked per-stream limit
+//   intervalMs: number,                           // Locked generation interval
+//   Add other locked params if needed (e.g., eventType)
+// };
 
+// Constants for cleanup
+const INACTIVITY_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes of no connections → cleanup
+const CLEANUP_INTERVAL_MS = 60 * 1000; // Check every 1 minute
+
+// Global cleanup loop (runs forever in background)
+setInterval(() => {
+    const now = Date.now();
+    for (const [streamId, state] of streams.entries()) {
+        if (now - state.lastActivity > INACTIVITY_TIMEOUT_MS) {
+            if (state.timer) {
+                clearInterval(state.timer); // Stop generating events
+                state.timer = null;
+            }
+            streams.delete(streamId); // Wipe the store
+            console.log(`[Cleanup] Expired inactive stream: ${streamId}`);
+        }
+    }
+}, CLEANUP_INTERVAL_MS);
 
 // Basic test stream: Sends periodic events with optional configs via query params
 app.get('/sse/test', (req, res) => {
@@ -59,108 +110,203 @@ app.get('/sse/test', (req, res) => {
         Connection: 'keep-alive',
     });
 
+    // Parse all query params (with defaults)
     const {
-        interval = 2000,
-        eventType,
-        retry,
-        maxEvents = Infinity,
-        largePayload,
-        errorAfter,
-        streamId = 'default',
-    } = req.query; // Default to 2s
-    let eventCount = 0;
-    let lastId = 0;
+        interval = '2000', // ms between events
+        eventType, // Custom event name (e.g., 'update')
+        retry, // Client retry ms
+        maxEvents: maxEventsQuery, // Max total events for this stream
+        delay, // Extra delay per event (ms)
+        largePayload, // Boolean: Add ~1MB data
+        errorAfter, // Send 500 after N events
+        streamId = 'default', // Unique stream identifier
+    } = req.query;
 
-    // Initialize store if new
-    if (!eventStore.has(streamId)) {
-        eventStore.set(streamId, []);
+    // Convert strings to numbers safely
+    const intervalMs = parseInt(interval) || 2000;
+    const requestedMax = maxEventsQuery ? parseInt(maxEventsQuery) : Infinity;
+    const delayMs = parseInt(delay) || 0;
+    const errorAfterNum = parseInt(errorAfter) || 0; // 0 = no error
+
+    // Get or initialize shared state for this streamId
+    let state;
+    if (!streams.has(streamId)) {
+        state = {
+            events: [], // History for catch-up
+            timer: null, // Will start below
+            lastActivity: Date.now(),
+            count: 0,
+            lastId: 0,
+            maxEvents: requestedMax, // Lock on first connection
+            intervalMs: intervalMs, // Lock interval too
+        };
+        streams.set(streamId, state);
+        console.log(
+            `[New] Created stream: ${streamId} (maxEvents=${state.maxEvents})`,
+        );
+    } else {
+        state = streams.get(streamId);
+        // Warn if trying to change locked params
+        if (requestedMax !== Infinity && requestedMax !== state.maxEvents) {
+            console.warn(
+                `[Mismatch] For stream ${streamId}: maxEvents was ${state.maxEvents}, requested ${requestedMax} – using original`,
+            );
+        }
     }
 
-    // Handle reconnection (client may send Last-Event-ID header)
+    // Update activity timestamp (resets 5-min timeout)
+    state.lastActivity = Date.now();
+
+    // Start global event generator if not running and not finished
+    if (!state.timer && state.count < state.maxEvents) {
+        state.timer = setInterval(() => {
+            // Check limits before generating
+            if (state.count >= state.maxEvents) {
+                clearInterval(state.timer);
+                state.timer = null;
+                console.log(
+                    `[Finished] Stream ${streamId} reached maxEvents=${state.maxEvents}`,
+                );
+                return;
+            }
+
+            // Simulate delay if requested (per-event pause)
+            if (delayMs > 0) {
+                setTimeout(() => generateEvent(), delayMs);
+                return;
+            } else {
+                generateEvent();
+            }
+
+            function generateEvent() {
+                state.count++;
+                state.lastId++;
+
+                let payload = {
+                    time: new Date().toISOString(),
+                    count: state.count,
+                    message: 'Test event',
+                };
+
+                // Add large payload if requested
+                if (largePayload === 'true') {
+                    payload.largeData = 'x'.repeat(1024 * 1024); // ~1MB
+                }
+
+                // Simulate error if reached errorAfter
+                if (errorAfterNum > 0 && state.count === errorAfterNum) {
+                    // Note: This ends the stream globally – adjust if per-connection needed
+                    clearInterval(state.timer);
+                    state.timer = null;
+                    console.log(
+                        `[Error] Stream ${streamId} simulated error after ${state.count} events`,
+                    );
+                    // We can't send 500 here (since SSE is open) – instead, send error event
+                    const errorEvent = {
+                        id: state.lastId,
+                        data: { error: 'Simulated server error' },
+                        event: 'error',
+                    };
+                    state.events.push(errorEvent);
+                    return;
+                }
+
+                const event = {
+                    id: state.lastId,
+                    data: payload,
+                    event: eventType,
+                };
+                state.events.push(event);
+
+                // Limit history size to prevent memory growth
+                if (state.events.length > 2000) state.events.shift(); // Keep last 2000
+            }
+        }, state.intervalMs);
+    }
+
+    // Handle reconnection / catch-up
     const lastEventId = req.headers['last-event-id']
         ? parseInt(req.headers['last-event-id'])
         : 0;
-    if (lastEventId > 0) {
-        const storedEvents = eventStore.get(streamId);
-        const resumeFrom =
-            storedEvents.findIndex((event) => event.id === lastEventId) + 1;
-        // TODO: have to look if all events are streamed successfully and connection fail
-        if (resumeFrom > 0) {
-            for (let i = resumeFrom; i < storedEvents.length; i++) {
-                // Send missed events
-                sendEvent(res, storedEvents[i].data, {
-                    id: storedEvents[i].id,
-                    event: eventType,
-                });
-            }
-            lastId = storedEvents[storedEvents.length - 1]?.id || 0;
-            eventCount = lastId; // Sync count
-        }
+    let lastSentId = lastEventId;
 
-        sendEvent(
-            res,
-            { message: `Resumed from ID ${lastEventId}, current: ${lastId}` },
-            { id: ++lastId, retry },
-        );
+    if (lastEventId > 0) {
+        const startIndex =
+            state.events.findIndex((e) => e.id === lastEventId) + 1;
+        if (startIndex > 0) {
+            // Send missed events
+            for (let i = startIndex; i < state.events.length; i++) {
+                const e = state.events[i];
+                sendEvent(res, e.data, { id: e.id, event: e.event, retry });
+                lastSentId = e.id;
+            }
+            sendEvent(
+                res,
+                { message: `Resumed from ID ${lastEventId}` },
+                { id: lastSentId + 1, retry },
+            );
+            lastSentId++;
+        } else {
+            lastSentId = -1;
+            sendEvent(
+                res,
+                { message: 'Last-Event-ID not found – starting live' },
+                { retry },
+            );
+        }
     } else {
-        // Initial connection message with optional retry
-        sendEvent(
-            res,
-            { message: 'Connected to test SSE server' },
-            { retry, id: ++lastId },
-        );
+        sendEvent(res, { message: 'Connected to live stream' }, { retry });
     }
 
-    // Reset/Start expiration timer on every new connection/reconnection
-    setStoreExpiration(streamId);
-
-    // Send events periodically
-    const streamInterval = setInterval(() => {
-        if (eventCount >= maxEvents) {
-            res.end();
-            return;
+    // Live tail: Poll for new events and send them
+    const liveInterval = setInterval(() => {
+        if (lastSentId < state.lastId) {
+            const newEvents = state.events.filter((e) => e.id > lastSentId);
+            newEvents.forEach((e) => {
+                sendEvent(res, e.data, { id: e.id, event: e.event, retry });
+                lastSentId = e.id;
+            });
         }
+    }, 500); // Poll every 500ms – efficient for low latency
 
-        if (errorAfter && eventCount == errorAfter) {
-            res.status(500).end('Simulated server error');
-            return;
-        }
-
-        sendNextEvent();
-
-        function sendNextEvent() {
-            let payload = {
-                time: new Date().toISOString(),
-                eventCount: ++eventCount,
-                message: 'Test event',
-            };
-
-            if (largePayload === 'true') {
-                // Simulate large payload (e.g., 1 MB of data)
-                payload.largeData = 'x'.repeat(1024 * 1024);
-            }
-
-            sendEvent(res, payload, { event: eventType, id: ++lastId });
-
-            // Store the event
-            const storedEvents = eventStore.get(streamId);
-            storedEvents.push({ id: lastId, data: payload });
-            if (storedEvents.length > 100) storedEvents.shift(); // Limit size for memory;
-
-            // Reset expiration timer because activity happened
-            setStoreExpiration(streamId);
-        }
-    }, parseInt(interval));
-
-    // Cleanup on client disconnect
-    res.on('close', () => {
-        clearInterval(streamInterval);
-        if (eventCount >= maxEvents) {
-            // Stream complete: Flush immediately
-            eventStore.delete(streamId);
-            storeExpirations.delete(streamId);
-        }
+    // On client disconnect
+    req.on('close', () => {
+        clearInterval(liveInterval); // Stop this client's poller
         res.end();
+        // Do NOT stop global timer or wipe store – inactivity cleanup handles that
+        // But update activity one last time (optional, for grace period)
+        if (streams.has(streamId)) {
+            streams.get(streamId).lastActivity = Date.now();
+        }
+    });
+});
+
+// Add this route anywhere in your app (preferably after the GET routes)
+app.delete('/sse/stream/:streamId', (req, res) => {
+    const { streamId } = req.params;
+
+    if (!streams.has(streamId)) {
+        return res.status(404).json({ error: `Stream ${streamId} not found` });
+    }
+
+    const state = streams.get(streamId);
+
+    // Stop generation
+    if (state.timer) {
+        clearInterval(state.timer);
+        state.timer = null;
+    }
+
+    // Wipe the store
+    streams.delete(streamId);
+
+    console.log(`[Manual Cleanup] Deleted stream: ${streamId}`);
+
+    res.status(200).json({
+        message: `Stream ${streamId} stopped and deleted successfully`,
+        wasActive: !!state.timer,
+        eventCount: state.count,
+        lastId: state.lastId,
     });
 });
 
@@ -185,32 +331,100 @@ app.get('/sse/error', (req, res) => {
 
 // Timeout simulation: Hangs for a long time
 app.get('/sse/timeout', (req, res) => {
-    setTimeout(() => {
-        res.status(408).send('Simulated timeout');
-    }, 30000); // 30s delay
-});
+    // Parse delay from query param (in milliseconds)
+    // Default to 30 seconds if missing or invalid
+    const delayMs = Math.max(1000, parseInt(req.query.delay) || 30000); // min 1s to avoid abuse
 
-// Multi-event type stream for testing custom events
-app.get('/sse/multi', (req, res) => {
+    // Optional: also support ?seconds= for readability
+    if (req.query.seconds) {
+        const seconds = parseInt(req.query.seconds);
+        if (!isNaN(seconds) && seconds > 0) {
+            delayMs = seconds * 1000;
+        }
+    }
+
+    // Optional logging for debugging
+    console.log(
+        `[Timeout] Simulating delay of ${delayMs}ms for request from ${req.ip}`,
+    );
+
+    // Send headers immediately (important for SSE-like feel, even though we eventually 408)
     res.set({
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
         Connection: 'keep-alive',
     });
 
-    let id = 0;
-    ['ping', 'update', 'alert'].forEach((type, index) => {
-        setTimeout(() => {
-            sendEvent(
-                res,
-                { message: `Event of type: ${type}` },
-                { event: type, id: ++id },
-            );
-            if (index == 2) res.end();
-        }, index * 5000);
-    });
+    // Send an initial message so client knows connection is open
+    res.write('data: Waiting for simulated timeout...\n\n');
+    res.flushHeaders();
 
-    req.on('close', () => res.end());
+    // Delay and then respond with 408 (Request Timeout)
+    setTimeout(() => {
+        res.status(408).send(
+            'Simulated timeout after ' + delayMs / 1000 + ' seconds',
+        );
+    }, delayMs);
+});
+
+// Multi-event type stream for testing custom events
+app.get('/sse/multi', (req, res) => {
+  res.set({
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive'
+  });
+
+  // Parse query params with safe defaults
+  const intervalMs = Math.max(100, parseInt(req.query.interval) || 1000);     // min 100ms to avoid spam
+  const eventCount = Math.max(1, Math.min(100, parseInt(req.query.count) || 3)); // 1–100 limit
+  const customTypes = req.query.types 
+    ? req.query.types.split(',').map(t => t.trim()).filter(t => t) 
+    : ['ping', 'update', 'alert']; // default cycle
+  const delayFirstMs = parseInt(req.query.delayFirst) || 0;
+
+  let index = 0;
+  let sentCount = 0;
+
+  // Optional: initial delay
+  setTimeout(() => {
+    const sendNext = () => {
+      if (sentCount >= eventCount) {
+        res.write('data: Sequence complete\n\n');
+        res.end();
+        return;
+      }
+
+      // Cycle through types
+      const eventType = customTypes[index % customTypes.length];
+      
+      index++;
+
+      const payload = {
+        message: `Event of type ${eventType} (${sentCount + 1}/${eventCount})`,
+        sequenceIndex: sentCount + 1,
+        timestamp: new Date().toISOString()
+      };
+
+      sendEvent(res, payload, { 
+        event: eventType,
+        id: sentCount + 1  // simple incremental ID
+      });
+
+      sentCount++;
+
+      // Schedule next
+      setTimeout(sendNext, intervalMs);
+    };
+
+    // Start the sequence
+    sendNext();
+  }, delayFirstMs);
+
+  // Cleanup on client disconnect
+  req.on('close', () => {
+    res.end();
+  });
 });
 
 // File streaming simulation
@@ -336,32 +550,18 @@ app.get('/sse/stream-file', (req, res) => {
 
 if (USE_HTTPS) {
     const options = {
-        key: fs.readFileSync('/certs/privkey.pem'), // Path inside container
-        cert: fs.readFileSync('/certs/cert.pem'),
+        key: readFileSync('/certs/privkey.pem'), // Path inside container
+        cert: readFileSync('/certs/cert.pem'),
     };
-    https.createServer(options, app).listen(PORT, () => {
+    createServer(options, app).listen(PORT, () => {
         console.log(
             `Advanced SSE test server running on HTTPS https://localhost:${PORT}`,
         );
-        console.log(
-            '- /sse/test?interval=1000&eventType=custom&retry=5&&maxEvents=10&delay=2---&largePayload=true&errorAfter=5',
-        );
-        console.log('- POST /sse/echo (send JSON body)');
-        console.log('- /sse/error?code=404');
-        console.log('- /sse/timeout');
-        console.log('- /sse/multi');
     });
 } else {
     app.listen(3000, () => {
         console.log(
             `Advanced SSE test server running on HTTP http://localhost:${PORT}`,
         );
-        console.log(
-            '- /sse/test?interval=1000&eventType=custom&retry=5&&maxEvents=10&delay=2---&largePayload=true&errorAfter=5',
-        );
-        console.log('- POST /sse/echo (send JSON body)');
-        console.log('- /sse/error?code=404');
-        console.log('- /sse/timeout');
-        console.log('- /sse/multi');
     });
 }

@@ -4,10 +4,10 @@ info:
   description: A configurable test server for Server-Sent Events (SSE) to validate proxies and clients.
   version: 1.0.0
 servers:
+  - url: https://voltmx-blueprints.fnxlabs.com
+    description: Production server
   - url: http://localhost:3000
     description: Local server
-  - url: https://your-prod-domain.com
-    description: Production server
 
 paths:
   /sse/test:
@@ -62,6 +62,18 @@ paths:
           query: ?maxEvents=10&streamId=test1
         - description: Error simulation
           query: ?errorAfter=5
+
+  /sse/stream/{streamId}:
+    delete:
+      summary: Manually stop and delete a stream
+      parameters:
+        - name: streamId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: Stream deleted }
+        '404': { description: Stream not found }
 
   /sse/stream-file:
     get:
@@ -138,7 +150,82 @@ paths:
 
   /sse/timeout:
     get:
-      summary: Simulate timeout (30s delay)
+      summary: Simulate a configurable server timeout
+      description: Delays response for a specified duration, then returns HTTP 408 (Request Timeout). Useful for testing proxy/client timeout handling.
+      parameters:
+        - name: delay
+          in: query
+          schema:
+            type: integer
+            default: 30000
+          description: Delay in milliseconds (minimum 1000ms)
+          example: 60000
+        - name: seconds
+          in: query
+          schema:
+            type: integer
+          description: Delay in seconds (overrides delay if provided)
+          example: 45
       responses:
         '408':
-          description: Timeout response
+          description: Simulated timeout response
+          content:
+            text/plain:
+              schema:
+                type: string
+        'default':
+          description: Initial connection message before timeout
+          content:
+            text/event-stream:
+              schema:
+                type: string
+      x-usage-examples:
+        - description: 30 seconds (default)
+          query: ""
+        - description: 90 seconds using seconds param
+          query: ?seconds=90
+        - description: 15 seconds using delay param
+          query: ?delay=15000
+
+  /sse/multi:
+    get:
+      summary: Multi-event type SSE stream (customizable)
+      description: Sends a configurable sequence of events with different types. Great for testing event filtering, dispatch, and timing behavior in clients/proxies.
+      parameters:
+        - name: interval
+          in: query
+          schema:
+            type: integer
+            default: 1000
+            minimum: 100
+          description: Delay between events in milliseconds
+          example: 500
+        - name: count
+          in: query
+          schema:
+            type: integer
+            default: 3
+            minimum: 1
+            maximum: 100
+          description: Number of events to send
+          example: 10
+        - name: types
+          in: query
+          schema:
+            type: string
+          description: Comma-separated list of event types to cycle through
+          example: info,warning,error
+        - name: delayFirst
+          in: query
+          schema:
+            type: integer
+            default: 0
+          description: Initial delay before first event (ms)
+          example: 2000
+      responses:
+        '200':
+          description: SSE stream with sequenced multi-type events
+          content:
+            text/event-stream:
+              schema:
+                type: string
