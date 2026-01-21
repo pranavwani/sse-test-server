@@ -336,8 +336,8 @@ app.get('/sse/stream-file', (req, res) => {
 
 if (USE_HTTPS) {
     const options = {
-        key: fs.readFileSync('/certs/cert.pem'), // Path inside container
-        cert: fs.readFileSync('/certs/privkey.pem'),
+        key: fs.readFileSync('/certs/privkey.pem'), // Path inside container
+        cert: fs.readFileSync('/certs/cert.pem'),
     };
     https.createServer(options, app).listen(PORT, () => {
         console.log(
