@@ -15,4 +15,4 @@ COPY . .
 EXPOSE 3000
 
 # Run the app
-CMD ["npm", "start"] # Or ["node", "server.js"] if no start script
+CMD ["node", "server.js"]
