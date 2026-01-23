@@ -76,7 +76,7 @@ const streams = new Map();
 //   events: array of {id, data, event: string?},  // Stored history for catch-up
 //   timer: NodeJS.Timeout | null,                 // Global interval for generating events
 //   lastActivity: number (Date.now()),            // For inactivity timeout
-//   count: number,                                // Total events generated so far
+//   eventCount: number,                           // Total events generated so far
 //   lastId: number,                               // Last event ID
 //   maxEvents: number | Infinity,                 // Locked per-stream limit
 //   intervalMs: number,                           // Locked generation interval
@@ -115,7 +115,7 @@ app.get('/sse/test', (req, res) => {
         interval = '2000', // ms between events
         eventType, // Custom event name (e.g., 'update')
         retry, // Client retry ms
-        maxEvents: maxEventsQuery, // Max total events for this stream
+        maxEvents = Infinity, // Max total events for this stream
         largePayload, // Boolean: Add ~1MB data
         errorAfter, // Send 500 after N events
         streamId = 'default', // Unique stream identifier
@@ -123,7 +123,9 @@ app.get('/sse/test', (req, res) => {
 
     // Convert strings to numbers safely
     const intervalMs = parseInt(interval) || 2000;
-    const requestedMax = maxEventsQuery ? parseInt(maxEventsQuery) : Infinity;
+    
+    const requestedMax = !isNaN(maxEvents) ? Number(maxEvents) : Infinity;
+    
     const errorAfterNum = parseInt(errorAfter) || 0; // 0 = no error
 
     // Get or initialize shared state for this streamId
@@ -133,7 +135,7 @@ app.get('/sse/test', (req, res) => {
             events: [], // History for catch-up
             timer: null, // Will start below
             lastActivity: Date.now(),
-            count: 0,
+            eventCount: 0,
             lastId: 0,
             maxEvents: requestedMax, // Lock on first connection
             intervalMs: intervalMs, // Lock interval too
@@ -156,10 +158,10 @@ app.get('/sse/test', (req, res) => {
     state.lastActivity = Date.now();
 
     // Start global event generator if not running and not finished
-    if (!state.timer && state.count < state.maxEvents) {
+    if (!state.timer && state.eventCount < state.maxEvents) {
         state.timer = setInterval(() => {
             // Check limits before generating
-            if (state.count >= state.maxEvents) {
+            if (state.eventCount >= state.maxEvents) {
                 clearInterval(state.timer);
                 state.timer = null;
                 console.log(
@@ -171,12 +173,12 @@ app.get('/sse/test', (req, res) => {
             generateEvent();
             
             function generateEvent() {
-                state.count++;
+                state.eventCount++;
                 state.lastId++;
 
                 let payload = {
                     time: new Date().toISOString(),
-                    count: state.count,
+                    eventCount: state.eventCount,
                     message: 'Test event',
                 };
 
@@ -186,12 +188,12 @@ app.get('/sse/test', (req, res) => {
                 }
 
                 // Simulate error if reached errorAfter
-                if (errorAfterNum > 0 && state.count === errorAfterNum) {
+                if (errorAfterNum > 0 && state.eventCount === errorAfterNum) {
                     // Note: This ends the stream globally – adjust if per-connection needed
                     clearInterval(state.timer);
                     state.timer = null;
                     console.log(
-                        `[Error] Stream ${streamId} simulated error after ${state.count} events`,
+                        `[Error] Stream ${streamId} simulated error after ${state.eventCount} events`,
                     );
                     // We can't send 500 here (since SSE is open) – instead, send error event
                     const errorEvent = {
@@ -297,7 +299,7 @@ app.delete('/sse/stream/:streamId', (req, res) => {
     res.status(200).json({
         message: `Stream ${streamId} stopped and deleted successfully`,
         wasActive: !!state.timer,
-        eventCount: state.count,
+        eventCount: state.eventCount,
         lastId: state.lastId,
     });
 });
