@@ -31,10 +31,6 @@ paths:
           in: query
           schema: { type: integer, default: Infinity }
           description: Max events before ending stream
-        - name: delay
-          in: query
-          schema: { type: integer }
-          description: Delay before next event (ms)
         - name: largePayload
           in: query
           schema: { type: boolean }

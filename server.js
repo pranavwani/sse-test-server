@@ -116,7 +116,6 @@ app.get('/sse/test', (req, res) => {
         eventType, // Custom event name (e.g., 'update')
         retry, // Client retry ms
         maxEvents: maxEventsQuery, // Max total events for this stream
-        delay, // Extra delay per event (ms)
         largePayload, // Boolean: Add ~1MB data
         errorAfter, // Send 500 after N events
         streamId = 'default', // Unique stream identifier
@@ -125,7 +124,6 @@ app.get('/sse/test', (req, res) => {
     // Convert strings to numbers safely
     const intervalMs = parseInt(interval) || 2000;
     const requestedMax = maxEventsQuery ? parseInt(maxEventsQuery) : Infinity;
-    const delayMs = parseInt(delay) || 0;
     const errorAfterNum = parseInt(errorAfter) || 0; // 0 = no error
 
     // Get or initialize shared state for this streamId
@@ -170,14 +168,8 @@ app.get('/sse/test', (req, res) => {
                 return;
             }
 
-            // Simulate delay if requested (per-event pause)
-            if (delayMs > 0) {
-                setTimeout(() => generateEvent(), delayMs);
-                return;
-            } else {
-                generateEvent();
-            }
-
+            generateEvent();
+            
             function generateEvent() {
                 state.count++;
                 state.lastId++;
@@ -333,7 +325,7 @@ app.get('/sse/error', (req, res) => {
 app.get('/sse/timeout', (req, res) => {
     // Parse delay from query param (in milliseconds)
     // Default to 30 seconds if missing or invalid
-    const delayMs = Math.max(1000, parseInt(req.query.delay) || 30000); // min 1s to avoid abuse
+    let delayMs = Math.max(1000, parseInt(req.query.delay) || 30000); // min 1s to avoid abuse
 
     // Optional: also support ?seconds= for readability
     if (req.query.seconds) {
@@ -361,9 +353,10 @@ app.get('/sse/timeout', (req, res) => {
 
     // Delay and then respond with 408 (Request Timeout)
     setTimeout(() => {
-        res.status(408).send(
-            'Simulated timeout after ' + delayMs / 1000 + ' seconds',
-        );
+        res.write(`data: Simulated timeout reached after ${delayMs/1000} seconds\n\n`);
+        res.write(`event: timeout\ndata: Connection will now close\n\n`);
+        
+        res.end();
     }, delayMs);
 });
 
