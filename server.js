@@ -167,6 +167,13 @@ app.get('/sse/test', (req, res) => {
                 console.log(
                     `[Finished] Stream ${streamId} reached maxEvents=${state.maxEvents}`,
                 );
+                  
+                res.end();  // end the request
+                
+                streams.delete(streamId); // wipe the store
+                
+                storeExpirations.delete(streamId);  // clear store expiration
+
                 return;
             }
 
