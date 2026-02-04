@@ -102,6 +102,14 @@ setInterval(() => {
     }
 }, CLEANUP_INTERVAL_MS);
 
+const yamlContent = fs.readFileSync('./openapi.yml', 'utf8');
+
+app.get('/openapi.yml', (req, res) => {
+  res.type('text/yaml');
+  res.set('Content-Disposition', 'inline');
+  res.send(yamlContent);
+});
+
 // Basic test stream: Sends periodic events with optional configs via query params
 app.get('/sse/test', (req, res) => {
     res.set({
