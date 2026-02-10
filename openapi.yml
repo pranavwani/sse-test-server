@@ -4,8 +4,10 @@ info:
   description: A configurable test server for Server-Sent Events (SSE) to validate proxies and clients.
   version: 1.0.0
 servers:
+  - url: https://sse-test-server.onrender.com
+    description: Public Production server    
   - url: https://voltmx-blueprints.fnxlabs.com
-    description: Production server
+    description: Private Production server
   - url: http://localhost:3000
     description: Local server
 
