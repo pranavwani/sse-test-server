@@ -80,38 +80,56 @@ const streams = new Map();
 //   lastId: number,                               // Last event ID
 //   maxEvents: number | Infinity,                 // Locked per-stream limit
 //   intervalMs: number,                           // Locked generation interval
-//   Add other locked params if needed (e.g., eventType)
+//   connections: Set<Response>,                   // Track active res for closure
+//   finished: boolean,                            // Existing, but used more consistently
 // };
 
 // Constants for cleanup
 const INACTIVITY_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes of no connections → cleanup
-const CLEANUP_INTERVAL_MS = 60 * 1000; // Check every 1 minute
 
-// Global cleanup loop (runs forever in background)
+// Background cleanup for finished + inactive streams (e.g. every 5 min)
 setInterval(() => {
     const now = Date.now();
     for (const [streamId, state] of streams.entries()) {
-        if (now - state.lastActivity > INACTIVITY_TIMEOUT_MS) {
-            if (state.timer) {
-                clearInterval(state.timer); // Stop generating events
-                state.timer = null;
-            }
-            streams.delete(streamId); // Wipe the store
-            console.log(`[Cleanup] Expired inactive stream: ${streamId}`);
+        if (state.finished && now - state.lastActivity > 30 * 60 * 1000) {
+            // 30 min grace after finish
+            streams.delete(streamId);
+            storeExpirations.delete(streamId);
+            console.log(
+                `[Cleanup] Removed finished stream ${streamId} after grace period`,
+            );
+        } else if (now - state.lastActivity > INACTIVITY_TIMEOUT_MS) {
+            // Existing inactivity logic for non-finished streams
+            if (state) clearInterval(state.timer);
+            streams.delete(streamId);
+            storeExpirations.delete(streamId);
+            console.log(`[Cleanup] Inactive stream expired: ${streamId}`);
         }
     }
-}, CLEANUP_INTERVAL_MS);
+}, INACTIVITY_TIMEOUT_MS);
 
 const yamlContent = fs.readFileSync('./openapi.yml', 'utf8');
 
 app.get('/openapi.yml', (req, res) => {
-  res.type('text/yaml');
-  res.set('Content-Disposition', 'inline');
-  res.send(yamlContent);
+    res.type('text/yaml');
+    res.set('Content-Disposition', 'inline');
+    res.send(yamlContent);
 });
 
 // Basic test stream: Sends periodic events with optional configs via query params
 app.get('/sse/test', (req, res) => {
+    const streamId = req.query.streamId || 'default';
+
+    // ─── Early check: if already finished → 204 immediately (stops reconnects) ───
+    let state = streams.get(streamId);
+    if (state?.finished === true) {
+        res.status(204).end();
+        console.log(
+            `[204 No Content] Finished stream ${streamId} – no retry allowed`,
+        );
+        return;
+    }
+
     res.set({
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
@@ -126,18 +144,16 @@ app.get('/sse/test', (req, res) => {
         maxEvents = Infinity, // Max total events for this stream
         largePayload, // Boolean: Add ~1MB data
         errorAfter, // Send 500 after N events
-        streamId = 'default', // Unique stream identifier
     } = req.query;
 
     // Convert strings to numbers safely
     const intervalMs = parseInt(interval) || 2000;
-    
+
     const requestedMax = !isNaN(maxEvents) ? Number(maxEvents) : Infinity;
-    
+
     const errorAfterNum = parseInt(errorAfter) || 0; // 0 = no error
 
     // Get or initialize shared state for this streamId
-    let state;
     if (!streams.has(streamId)) {
         state = {
             events: [], // History for catch-up
@@ -147,6 +163,8 @@ app.get('/sse/test', (req, res) => {
             lastId: 0,
             maxEvents: requestedMax, // Lock on first connection
             intervalMs: intervalMs, // Lock interval too
+            connections: new Set(), // Track active connections
+            finished: false, // Explicit init
         };
         streams.set(streamId, state);
         console.log(
@@ -165,28 +183,55 @@ app.get('/sse/test', (req, res) => {
     // Update activity timestamp (resets 5-min timeout)
     state.lastActivity = Date.now();
 
+    // Track this connection
+    state.connections.add(res);
+
     // Start global event generator if not running and not finished
     if (!state.timer && state.eventCount < state.maxEvents) {
         state.timer = setInterval(() => {
             // Check limits before generating
+            // In the interval (when generating events)
             if (state.eventCount >= state.maxEvents) {
                 clearInterval(state.timer);
                 state.timer = null;
-                console.log(
-                    `[Finished] Stream ${streamId} reached maxEvents=${state.maxEvents}`,
+
+                // Send a final marker event (optional but very helpful)
+                sendEvent(
+                    res,
+                    {
+                        done: true,
+                        totalEvents: state.eventCount,
+                        message: 'Stream completed – no more events',
+                    },
+                    {
+                        id: state.lastId + 1,
+                        event: 'end',
+                        retry: 60000, // or whatever – gives breathing room
+                    },
                 );
-                  
-                res.end();  // end the request
-                
-                streams.delete(streamId); // wipe the store
-                
-                storeExpirations.delete(streamId);  // clear store expiration
+
+                // Do NOT delete the stream here
+                // Instead mark it finished
+                state.finished = true;
+
+                // Close all active connections after delay (gives poll time)
+                setTimeout(() => {
+                    for (const conn of state.connections) {
+                        conn.end();
+                    }
+                    state.connections.clear();
+                    console.log(`[Finished] Closed all connections for ${streamId}`);
+                }, 1000); // 1s > poll interval (500ms)
+
+                console.log(
+                    `[Reached max] ${streamId} marked finished – waiting for reconnects to send 204`,
+                );
 
                 return;
             }
 
             generateEvent();
-            
+
             function generateEvent() {
                 state.eventCount++;
                 state.lastId++;
@@ -281,12 +326,14 @@ app.get('/sse/test', (req, res) => {
     // On client disconnect
     req.on('close', () => {
         clearInterval(liveInterval); // Stop this client's poller
-        res.end();
         // Do NOT stop global timer or wipe store – inactivity cleanup handles that
         // But update activity one last time (optional, for grace period)
         if (streams.has(streamId)) {
-            streams.get(streamId).lastActivity = Date.now();
+            const state = streams.get(streamId);
+            state.connections.delete(res); // NEW: Remove from tracking
+            state.lastActivity = Date.now();
         }
+        res.end();
     });
 });
 
@@ -370,71 +417,79 @@ app.get('/sse/timeout', (req, res) => {
 
     // Delay and then respond with 408 (Request Timeout)
     setTimeout(() => {
-        res.write(`data: Simulated timeout reached after ${delayMs/1000} seconds\n\n`);
+        res.write(
+            `data: Simulated timeout reached after ${delayMs / 1000} seconds\n\n`,
+        );
         res.write(`event: timeout\ndata: Connection will now close\n\n`);
-        
+
         res.end();
     }, delayMs);
 });
 
 // Multi-event type stream for testing custom events
 app.get('/sse/multi', (req, res) => {
-  res.set({
-    'Content-Type': 'text/event-stream',
-    'Cache-Control': 'no-cache',
-    'Connection': 'keep-alive'
-  });
+    res.set({
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        Connection: 'keep-alive',
+    });
 
-  // Parse query params with safe defaults
-  const intervalMs = Math.max(100, parseInt(req.query.interval) || 1000);     // min 100ms to avoid spam
-  const eventCount = Math.max(1, Math.min(100, parseInt(req.query.count) || 3)); // 1–100 limit
-  const customTypes = req.query.types 
-    ? req.query.types.split(',').map(t => t.trim()).filter(t => t) 
-    : ['ping', 'update', 'alert']; // default cycle
-  const delayFirstMs = parseInt(req.query.delayFirst) || 0;
+    // Parse query params with safe defaults
+    const intervalMs = Math.max(100, parseInt(req.query.interval) || 1000); // min 100ms to avoid spam
+    const eventCount = Math.max(
+        1,
+        Math.min(100, parseInt(req.query.count) || 3),
+    ); // 1–100 limit
+    const customTypes = req.query.types
+        ? req.query.types
+              .split(',')
+              .map((t) => t.trim())
+              .filter((t) => t)
+        : ['ping', 'update', 'alert']; // default cycle
+    const delayFirstMs = parseInt(req.query.delayFirst) || 0;
 
-  let index = 0;
-  let sentCount = 0;
+    let index = 0;
+    let sentCount = 0;
 
-  // Optional: initial delay
-  setTimeout(() => {
-    const sendNext = () => {
-      if (sentCount >= eventCount) {
-        res.write('data: Sequence complete\n\n');
+    // Optional: initial delay
+    setTimeout(() => {
+        const sendNext = () => {
+            if (sentCount >= eventCount) {
+                res.write('data: Sequence complete\n\n');
+                res.end();
+                return;
+            }
+
+            // Cycle through types
+            const eventType = customTypes[index % customTypes.length];
+
+            index++;
+
+            const payload = {
+                message: `Event of type ${eventType} (${sentCount + 1}/${eventCount})`,
+                sequenceIndex: sentCount + 1,
+                timestamp: new Date().toISOString(),
+            };
+
+            sendEvent(res, payload, {
+                event: eventType,
+                id: sentCount + 1, // simple incremental ID
+            });
+
+            sentCount++;
+
+            // Schedule next
+            setTimeout(sendNext, intervalMs);
+        };
+
+        // Start the sequence
+        sendNext();
+    }, delayFirstMs);
+
+    // Cleanup on client disconnect
+    req.on('close', () => {
         res.end();
-        return;
-      }
-
-      // Cycle through types
-      const eventType = customTypes[index % customTypes.length];
-      
-      index++;
-
-      const payload = {
-        message: `Event of type ${eventType} (${sentCount + 1}/${eventCount})`,
-        sequenceIndex: sentCount + 1,
-        timestamp: new Date().toISOString()
-      };
-
-      sendEvent(res, payload, { 
-        event: eventType,
-        id: sentCount + 1  // simple incremental ID
-      });
-
-      sentCount++;
-
-      // Schedule next
-      setTimeout(sendNext, intervalMs);
-    };
-
-    // Start the sequence
-    sendNext();
-  }, delayFirstMs);
-
-  // Cleanup on client disconnect
-  req.on('close', () => {
-    res.end();
-  });
+    });
 });
 
 // File streaming simulation
